@@ -1,6 +1,8 @@
 #ifndef __TRACYVULKAN_HPP__
 #define __TRACYVULKAN_HPP__
 
+// clang-format off
+
 #if !defined TRACY_ENABLE
 
 #define TracyVkContext(x,y,z,w) nullptr
@@ -22,6 +24,9 @@
 #define TracyVkZoneS(c,x,y,z)
 #define TracyVkZoneCS(c,x,y,z,w)
 #define TracyVkZoneTransientS(c,x,y,z,w,a)
+
+#  define TracyVkStartTransient( c, x, y, z )
+#  define TracyVkEndTransient( c, x, y )
 
 namespace tracy
 {
@@ -89,6 +94,8 @@ struct VkSymbolTable
 class VkCtx
 {
     friend class VkCtxScope;
+    friend void VkCtxStart( VkCtx* ctx, uint32_t line, const char* source, size_t sourceSz, const char* function, size_t functionSz, const char* name, size_t nameSz, VkCommandBuffer cmdbuf, bool is_active);
+    friend void VkCtxEnd( VkCtx* ctx, VkCommandBuffer cmdbuf , bool is_active);
 
     enum { QueryCount = 64 * 1024 };
 
@@ -628,6 +635,46 @@ private:
     VkCtx* m_ctx;
 };
 
+tracy_force_inline void VkCtxStart( VkCtx* ctx, uint32_t line, const char* source, size_t sourceSz, const char* function, size_t functionSz, const char* name, size_t nameSz, VkCommandBuffer cmdbuf, bool is_active)
+{
+#ifdef TRACY_ON_DEMAND
+    is_active = is_active && GetProfiler().IsConnected();
+#endif
+    if( !is_active ) return;
+
+    const auto queryId = ctx->NextQueryId();
+    CONTEXT_VK_FUNCTION_WRAPPER( vkCmdWriteTimestamp( cmdbuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->m_query, queryId ) );
+
+    const auto srcloc = Profiler::AllocSourceLocation( line, source, sourceSz, function, functionSz, name, nameSz );
+    auto item = Profiler::QueueSerial();
+    MemWrite( &item->hdr.type, QueueType::GpuZoneBeginAllocSrcLocSerial );
+    MemWrite( &item->gpuZoneBegin.cpuTime, Profiler::GetTime() );
+    MemWrite( &item->gpuZoneBegin.srcloc, srcloc );
+    MemWrite( &item->gpuZoneBegin.thread, GetThreadHandle() );
+    MemWrite( &item->gpuZoneBegin.queryId, uint16_t( queryId ) );
+    MemWrite( &item->gpuZoneBegin.context, ctx->GetId() );
+    Profiler::QueueSerialFinish();
+}
+
+tracy_force_inline void VkCtxEnd( VkCtx* ctx, VkCommandBuffer cmdbuf , bool is_active)
+{
+#ifdef TRACY_ON_DEMAND
+    is_active = is_active && GetProfiler().IsConnected();
+#endif
+    if( !is_active ) return;
+
+    const auto queryId = ctx->NextQueryId();
+    CONTEXT_VK_FUNCTION_WRAPPER(vkCmdWriteTimestamp( cmdbuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->m_query, queryId ) );
+
+    auto item = Profiler::QueueSerial();
+    MemWrite( &item->hdr.type, QueueType::GpuZoneEndSerial );
+    MemWrite( &item->gpuZoneEnd.cpuTime, Profiler::GetTime() );
+    MemWrite( &item->gpuZoneEnd.thread, GetThreadHandle() );
+    MemWrite( &item->gpuZoneEnd.queryId, uint16_t( queryId ) );
+    MemWrite( &item->gpuZoneEnd.context, ctx->GetId() );
+    Profiler::QueueSerialFinish();
+}
+
 #if defined TRACY_VK_USE_SYMBOL_TABLE
 static inline VkCtx* CreateVkContext( VkInstance instance, VkPhysicalDevice physdev, VkDevice device, VkQueue queue, VkCommandBuffer cmdbuf, PFN_vkGetInstanceProcAddr instanceProcAddr, PFN_vkGetDeviceProcAddr getDeviceProcAddr, bool calibrated = false )
 #else
@@ -695,12 +742,16 @@ using TracyVkCtx = tracy::VkCtx*;
 #  define TracyVkZone( ctx, cmdbuf, name ) TracyVkNamedZoneS( ctx, ___tracy_gpu_zone, cmdbuf, name, TRACY_CALLSTACK, true )
 #  define TracyVkZoneC( ctx, cmdbuf, name, color ) TracyVkNamedZoneCS( ctx, ___tracy_gpu_zone, cmdbuf, name, color, TRACY_CALLSTACK, true )
 #  define TracyVkZoneTransient( ctx, varname, cmdbuf, name, active ) TracyVkZoneTransientS( ctx, varname, cmdbuf, name, TRACY_CALLSTACK, active )
+#  define TracyVkStartTransient( ctx, cmdbuf, name, active )
+#  define TracyVkEndTransient( ctx, cmdbuf, active )
 #else
 #  define TracyVkNamedZone( ctx, varname, cmdbuf, name, active ) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,TracyLine) { name, TracyFunction,  TracyFile, (uint32_t)TracyLine, 0 }; tracy::VkCtxScope varname( ctx, &TracyConcat(__tracy_gpu_source_location,TracyLine), cmdbuf, active );
 #  define TracyVkNamedZoneC( ctx, varname, cmdbuf, name, color, active ) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,TracyLine) { name, TracyFunction,  TracyFile, (uint32_t)TracyLine, color }; tracy::VkCtxScope varname( ctx, &TracyConcat(__tracy_gpu_source_location,TracyLine), cmdbuf, active );
 #  define TracyVkZone( ctx, cmdbuf, name ) TracyVkNamedZone( ctx, ___tracy_gpu_zone, cmdbuf, name, true )
 #  define TracyVkZoneC( ctx, cmdbuf, name, color ) TracyVkNamedZoneC( ctx, ___tracy_gpu_zone, cmdbuf, name, color, true )
 #  define TracyVkZoneTransient( ctx, varname, cmdbuf, name, active ) tracy::VkCtxScope varname( ctx, TracyLine, TracyFile, strlen( TracyFile ), TracyFunction, strlen( TracyFunction ), name, strlen( name ), cmdbuf, active );
+#  define TracyVkStartTransient( ctx, cmdbuf, name, active ) tracy::VkCtxStart( ctx, TracyLine, TracyFile, strlen( TracyFile ), TracyFunction, strlen( TracyFunction ), name, strlen( name ), cmdbuf, active );
+#  define TracyVkEndTransient( ctx, cmdbuf, active ) tracy::VkCtxEnd( ctx, cmdbuf, active );
 #endif
 #define TracyVkCollect( ctx, cmdbuf ) ctx->Collect( cmdbuf );
 
