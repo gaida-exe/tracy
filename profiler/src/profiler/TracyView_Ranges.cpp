@@ -14,14 +14,17 @@ void View::DrawRanges()
     ImGui::Separator();
     DrawRangeEntry( m_statRange, ICON_FA_ARROW_UP_WIDE_SHORT " Statistics", 0x448888EE, "RangeStatisticsCopyFrom", 1 );
     ImGui::Separator();
-    DrawRangeEntry( m_waitStackRange, ICON_FA_HOURGLASS_HALF " Wait stacks", 0x44EEB588, "RangeWaitStackCopyFrom", 2 );
+    DrawRangeEntry( m_flameRange, ICON_FA_FIRE_FLAME_CURVED " Flame", 0x4488B5EE, "RangeFlameCopyFrom", 2 );
     ImGui::Separator();
-    DrawRangeEntry( m_memInfo.range, ICON_FA_MEMORY " Memory", 0x4488EEE3, "RangeMemoryCopyFrom", 3 );
+    DrawRangeEntry( m_waitStackRange, ICON_FA_HOURGLASS_HALF " Wait stacks", 0x44EEB588, "RangeWaitStackCopyFrom", 3 );
+    ImGui::Separator();
+    DrawRangeEntry( m_memInfo.range, ICON_FA_MEMORY " Memory", 0x4488EEE3, "RangeMemoryCopyFrom", 4 );
     ImGui::End();
 }
 
 void View::DrawRangeEntry( Range& range, const char* label, uint32_t color, const char* popupLabel, int id )
 {
+    ImGui::PushID( id );
     SmallColorBox( color );
     ImGui::SameLine();
     if( SmallCheckbox( label, &range.active ) )
@@ -79,14 +82,20 @@ void View::DrawRangeEntry( Range& range, const char* label, uint32_t color, cons
         if( id != 2 )
         {
             ImGui::SameLine();
-            if( SmallButtonDisablable( ICON_FA_HOURGLASS_HALF " Copy from wait stacks", m_waitStackRange.min == 0 && m_waitStackRange.max == 0 ) ) range = m_waitStackRange;
+            if( SmallButtonDisablable( ICON_FA_FIRE_FLAME_CURVED " Copy from flame", m_flameRange.min == 0 && m_flameRange.max == 0 ) ) range = m_flameRange;
         }
         if( id != 3 )
+        {
+            ImGui::SameLine();
+            if( SmallButtonDisablable( ICON_FA_HOURGLASS_HALF " Copy from wait stacks", m_waitStackRange.min == 0 && m_waitStackRange.max == 0 ) ) range = m_waitStackRange;
+        }
+        if( id != 4 )
         {
             ImGui::SameLine();
             if( SmallButtonDisablable( ICON_FA_MEMORY " Copy from memory", m_memInfo.range.min == 0 && m_memInfo.range.max == 0 ) ) range = m_memInfo.range;
         }
     }
+    ImGui::PopID();
 }
 
 void View::HandleRange( Range& range, int64_t timespan, const ImVec2& wpos, float w )

@@ -3,13 +3,14 @@
 #endif
 
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unordered_map>
-
 #include <sys/stat.h>
+#include <unordered_map>
+#include <zstd.h>
 
 #ifdef _MSC_VER
 #  define stat64 _stat64
@@ -18,12 +19,9 @@
 #  define stat64 stat
 #endif
 
-#include "json.hpp"
-
 #include "../../server/TracyFileWrite.hpp"
 #include "../../server/TracyMmap.hpp"
 #include "../../server/TracyWorker.hpp"
-#include "../../zstd/zstd.h"
 
 using json = nlohmann::json;
 
@@ -91,7 +89,7 @@ int main( int argc, char** argv )
         auto zctx = ZSTD_createDStream();
         ZSTD_initDStream( zctx );
 
-        enum { tmpSize = 64*1024 };
+        constexpr size_t tmpSize = 64*1024;
         auto tmp = new char[tmpSize];
 
         ZSTD_inBuffer_s zin = { zbuf, (size_t)zsz };

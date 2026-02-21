@@ -185,7 +185,7 @@ int main( int argc, char** argv )
         }
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
     }
-    printf( "\nQueue delay: %s\nTimer resolution: %s\n", tracy::TimeToString( worker.GetDelay() ), tracy::TimeToString( worker.GetResolution() ) );
+    printf( "\nTimer resolution: %s\n", tracy::TimeToString( worker.GetResolution() ) );
 
 #ifdef _WIN32
     signal( SIGINT, SigInt );
@@ -218,6 +218,7 @@ int main( int argc, char** argv )
         const auto mbps = worker.GetMbpsData().back();
         const auto compRatio = worker.GetCompRatio();
         const auto netTotal = worker.GetDataTransferred();
+        const auto queueSize = worker.GetSendQueueSize();
         lock.unlock();
 
         // Output progress info only if destination is a TTY to avoid bloating
@@ -248,6 +249,8 @@ int main( int argc, char** argv )
             }
             printf( " | ");
             AnsiPrintf( ANSI_RED, "%s", tracy::TimeToString( worker.GetLastTime() - firstTime ) );
+            printf( " | ");
+            AnsiPrintf( ANSI_RED ANSI_BOLD, "%s query backlog", tracy::RealToString( queueSize ) );
             fflush( stdout );
         }
 

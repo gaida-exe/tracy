@@ -1,14 +1,20 @@
 #include <inttypes.h>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 #include "../public/common/TracyStackFrames.hpp"
+#include "TracyConfig.hpp"
 #include "TracyImGui.hpp"
+#include "TracyMouse.hpp"
 #include "TracyPrint.hpp"
 #include "TracyUtility.hpp"
 #include "TracyView.hpp"
+#include "../Fonts.hpp"
 
 namespace tracy
 {
+
+extern double s_time;
 
 void View::DrawCallstackWindow()
 {
@@ -26,6 +32,9 @@ void View::DrawCallstackWindow()
 
 void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
 {
+    auto& crash = m_worker.GetCrashEvent();
+    const bool hasCrashed = crash.thread != 0 && crash.callstack == callstack;
+
     auto& cs = m_worker.GetCallstack( callstack );
     if( ClipboardButton() )
     {
@@ -96,23 +105,70 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
         }
         ImGui::SetClipboardText( s.str().c_str() );
     }
+    if( s_config.llm )
+    {
+        auto Attach = [&]() {
+            auto json = GetCallstackJson( cs );
+            if( hasCrashed )
+            {
+                json["crashed"] = true;
+                if( crash.message ) json["crash_reason"] = m_worker.GetString( crash.message );
+                auto threadName = m_worker.GetThreadName( crash.thread );
+                if( strcmp( threadName, "???" ) != 0 ) json["crash_thread"] = threadName;
+            }
+            AddLlmAttachment( json );
+        };
+
+        ImGui::SameLine();
+        if( ImGui::SmallButton( ICON_FA_ROBOT ) )
+        {
+            Attach();
+        }
+        if( ImGui::IsItemHovered() && IsMouseClicked( ImGuiMouseButton_Right ) )
+        {
+            ImGui::OpenPopup( "##callstackllm" );
+        }
+        if( ImGui::BeginPopup( "##callstackllm" ) )
+        {
+            if( ImGui::Selectable( "What is program doing at this moment?" ) )
+            {
+                Attach();
+                AddLlmQuery( "What is program doing at this moment?" );
+                ImGui::CloseCurrentPopup();
+            }
+            if( ImGui::Selectable( "Walk me through the details of this callstack, step by step, explaining the code." ) )
+            {
+                Attach();
+                AddLlmQuery( "Walk me through the details of this callstack, step by step, explaining the code." );
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();
-    SmallCheckbox( ICON_FA_SHIELD_HALVED " External frames", &m_showExternalFrames );
+    SmallCheckbox( ICON_FA_SHIELD_HALVED " External", &m_showExternalFrames );
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();
-    ImGui::TextUnformatted( ICON_FA_AT " Frame location:" );
+    SmallCheckbox( ICON_FA_SCISSORS " Short images", &m_shortImageNames );
+    ImGui::SameLine();
+    ImGui::Spacing();
+    ImGui::SameLine();
+    ImGui::TextUnformatted( " Frame at:" );
     ImGui::SameLine();
     ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 0, 0 ) );
-    ImGui::RadioButton( "Source code", &m_showCallstackFrameAddress, 0 );
-    ImGui::SameLine();
-    ImGui::RadioButton( "Entry point", &m_showCallstackFrameAddress, 3 );
-    ImGui::SameLine();
-    ImGui::RadioButton( "Return address", &m_showCallstackFrameAddress, 1 );
-    ImGui::SameLine();
-    ImGui::RadioButton( "Symbol address", &m_showCallstackFrameAddress, 2 );
+    ImGui::SetNextItemWidth( ImGui::CalcTextSize( "Symbol address xxx" ).x );
+    ImGui::Combo( "##frameat", &m_showCallstackFrameAddress, "Source code\0Return address\0Symbol address\0Entry point\0" );
+
+    if( hasCrashed )
+    {
+        ImGui::SameLine();
+        ImGui::Spacing();
+        ImGui::SameLine();
+        TextColoredUnformatted( ImVec4( 1.f, 0.2f, 0.2f, 1.f ), ICON_FA_SKULL " Crash" );
+    }
 
     if( globalEntriesButton && m_worker.AreCallstackSamplesReady() )
     {
@@ -125,7 +181,7 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
                 ImGui::SameLine();
                 ImGui::Spacing();
                 ImGui::SameLine();
-                if( ImGui::Button( ICON_FA_DOOR_OPEN " Global entry statistics" ) )
+                if( ImGui::Button( ICON_FA_DOOR_OPEN " Entry stacks" ) )
                 {
                     ShowSampleParents( frame->data[0].symAddr, true );
                 }
@@ -133,6 +189,121 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
         }
     }
     ImGui::PopStyleVar();
+
+#ifndef __EMSCRIPTEN__
+    if( s_config.llm )
+    {
+        bool force = false;
+        if( s_config.llmAnnotateCallstacks )
+        {
+            std::lock_guard lock( m_callstackDescLock );
+            auto it = m_callstackDesc.find( callstack );
+            if( it == m_callstackDesc.end() ) force = true;
+        }
+        ImGui::SameLine();
+        ImGui::SeparatorEx( ImGuiSeparatorFlags_Vertical );
+        ImGui::SameLine();
+        bool clicked = false;
+        if( ImGui::SmallButton( ICON_FA_TAG ) || force )
+        {
+            clicked = true;
+            nlohmann::json req = {
+                {
+                    { "role", "system" },
+                    { "content", "You are a helpful assistant. You analyze callstacks and provide a short description of what the program is doing at this moment. Your reply must be less than 100 characters." }
+                },
+                {
+                    { "role", "user" },
+                    { "content", GetCallstackJson( cs )["frames"].dump() }
+                }
+            };
+
+            m_llm.QueueFastMessageLocking( req, [this, callstack] (nlohmann::json res) {
+                if( res.contains( "choices" ) )
+                {
+                    auto& choices = res["choices"];
+                    if( choices.is_array() && !choices.empty() )
+                    {
+                        auto& c0 = choices[0];
+                        if( c0.contains( "message" ) )
+                        {
+                            auto& msg = c0["message"];
+                            if( msg.contains( "role" ) && msg.contains( "content" ) )
+                            {
+                                auto& role = msg["role"];
+                                auto& content = msg["content"];
+                                if( role.is_string() && content.is_string() && msg["role"].get_ref<const std::string&>() == "assistant" )
+                                {
+                                    auto& str = msg["content"].get_ref<const std::string&>();
+                                    if( str.size() <= 120 )
+                                    {
+                                        if( str.find( '\n' ) != std::string::npos || str.find( '\r' ) != std::string::npos )
+                                        {
+                                            auto tmp = str;
+                                            std::ranges::replace( tmp, '\n', ' ' );
+                                            std::ranges::replace( tmp, '\r', ' ' );
+
+                                            std::lock_guard lock( m_callstackDescLock );
+                                            m_callstackDesc[callstack] = tmp;
+                                        }
+                                        else
+                                        {
+                                            std::lock_guard lock( m_callstackDescLock );
+                                            m_callstackDesc[callstack] = str;
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if( res.contains( "error" ) )
+                {
+                    auto& err = res["error"];
+                    if( err.contains( "message" ) )
+                    {
+                        auto& msg = err["message"];
+                        if( msg.is_string() )
+                        {
+                            std::lock_guard lock( m_callstackDescLock );
+                            m_callstackDesc[callstack] = "<error> " + msg.get_ref<const std::string&>();
+                            return;
+                        }
+                    }
+                }
+
+                std::lock_guard lock( m_callstackDescLock );
+                m_callstackDesc[callstack] = "<error>";
+            } );
+        }
+
+        std::lock_guard lock( m_callstackDescLock );
+        auto it = m_callstackDesc.find( callstack );
+        if( it != m_callstackDesc.end() )
+        {
+            ImGui::SameLine();
+            if( strcmp( it->second.c_str(), "…" ) == 0 )
+            {
+                DrawWaitingDots( s_time, true, true );
+            }
+            else if( strncmp( it->second.c_str(), "<error>", 7 ) == 0 )
+            {
+                TextColoredUnformatted( ImVec4( 1.0f, 0.3f, 0.3f, 1.0f ), it->second.c_str() );
+            }
+            else
+            {
+                ImGui::TextUnformatted( it->second.c_str() );
+            }
+            if( clicked ) it->second = "…";
+        }
+        else if( clicked )
+        {
+            m_callstackDesc.emplace( callstack, "…" );
+        }
+    }
+#endif
 
     ImGui::Separator();
     if( ImGui::BeginTable( "##callstack", 4, ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY ) )
@@ -209,7 +380,7 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
                     {
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
-                        ImGui::PushFont( m_smallFont );
+                        ImGui::PushFont( g_fonts.normal, FontSmall );
                         TextDisabledUnformatted( "external" );
                         ImGui::TableNextColumn();
                         if( external == 1 )
@@ -233,7 +404,7 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
                     }
                     else
                     {
-                        ImGui::PushFont( m_smallFont );
+                        ImGui::PushFont( g_fonts.normal, FontSmall );
                         TextDisabledUnformatted( "inline" );
                         ImGui::PopFont();
                     }
@@ -385,7 +556,28 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
                     }
                     ImGui::PopTextWrapPos();
                     ImGui::TableNextColumn();
-                    if( image ) TextDisabledUnformatted( image );
+                    if( image )
+                    {
+                        const char* end = image + strlen( image );
+
+                        if( m_shortImageNames )
+                        {
+                            const char* ptr = end - 1;
+                            while( ptr > image && *ptr != '/' && *ptr != '\\' ) ptr--;
+                            if( *ptr == '/' || *ptr == '\\' ) ptr++;
+                            const auto cw = ImGui::GetContentRegionAvail().x;
+                            const auto tw = ImGui::CalcTextSize( image, end ).x;
+                            TextDisabledUnformatted( ptr );
+                            if( ptr != image || tw > cw ) TooltipIfHovered( image );
+                        }
+                        else
+                        {
+                            const auto cw = ImGui::GetContentRegionAvail().x;
+                            const auto tw = ImGui::CalcTextSize( image, end ).x;
+                            TextDisabledUnformatted( image );
+                            if( tw > cw ) TooltipIfHovered( image );
+                        }
+                    }
                 }
             }
         }
@@ -393,7 +585,7 @@ void View::DrawCallstackTable( uint32_t callstack, bool globalEntriesButton )
         {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::PushFont( m_smallFont );
+            ImGui::PushFont( g_fonts.normal, FontSmall );
             TextDisabledUnformatted( "external" );
             ImGui::TableNextColumn();
             if( external == 1 )
@@ -436,12 +628,15 @@ void View::SmallCallstackButton( const char* name, uint32_t callstack, int& idx,
 void View::DrawCallstackCalls( uint32_t callstack, uint16_t limit ) const
 {
     const auto& csdata = m_worker.GetCallstack( callstack );
-    const auto cssz = std::min( csdata.size(), limit );
     bool first = true;
-    for( uint16_t i=0; i<cssz; i++ )
+    for( auto& v : csdata )
     {
-        const auto frameData = m_worker.GetCallstackFrame( csdata[i] );
+        const auto frameData = m_worker.GetCallstackFrame( v );
         if( !frameData ) break;
+        const auto& frame = frameData->data[frameData->size - 1];
+        auto filename = m_worker.GetString( frame.file );
+        auto image = frameData->imageName.Active() ? m_worker.GetString( frameData->imageName ) : nullptr;
+        if( IsFrameExternal( filename, image ) ) continue;
         if( first )
         {
             first = false;
@@ -452,7 +647,6 @@ void View::DrawCallstackCalls( uint32_t callstack, uint16_t limit ) const
             TextDisabledUnformatted( ICON_FA_LEFT_LONG );
             ImGui::SameLine();
         }
-        const auto& frame = frameData->data[frameData->size - 1];
         auto txt = m_worker.GetString( frame.name );
         if( txt[0] == '[' )
         {
@@ -466,6 +660,7 @@ void View::DrawCallstackCalls( uint32_t callstack, uint16_t limit ) const
         {
             ImGui::TextUnformatted( ShortenZoneName( ShortenName::Always, txt ) );
         }
+        if( --limit == 0 ) break;
     }
 }
 
@@ -540,7 +735,7 @@ void View::CallstackTooltipContents( uint32_t idx )
                 if( frameData->imageName.Active() )
                 {
                     ImGui::SameLine();
-                    ImGui::PushFont( m_smallFont );
+                    ImGui::PushFont( g_fonts.normal, FontSmall );
                     ImGui::AlignTextToFramePadding();
                     TextDisabledUnformatted( m_worker.GetString( frameData->imageName ) );
                     ImGui::PopFont();

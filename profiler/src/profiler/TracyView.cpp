@@ -13,15 +13,18 @@
 
 #include "imgui.h"
 
+#include "TracyConfig.hpp"
 #include "TracyFileRead.hpp"
 #include "TracyFilesystem.hpp"
 #include "TracyImGui.hpp"
+#include "TracyManualData.hpp"
 #include "TracyPrint.hpp"
 #include "TracySourceView.hpp"
 #include "TracyTexture.hpp"
 #include "TracyView.hpp"
 #include "../server/TracySysUtil.hpp"
 #include "../public/common/TracyStackFrames.hpp"
+#include "../Fonts.hpp"
 
 #include "imgui_internal.h"
 #include "IconsFontAwesome6.h"
@@ -35,71 +38,71 @@ namespace tracy
 
 double s_time = 0;
 
-View::View( void(*cbMainThread)(const std::function<void()>&, bool), const char* addr, uint16_t port, ImFont* fixedWidth, ImFont* smallFont, ImFont* bigFont, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb, const Config& config, AchievementsMgr* amgr )
-    : m_worker( addr, port, config.memoryLimit == 0 ? -1 : ( config.memoryLimitPercent * tracy::GetPhysicalMemorySize() / 100 ) )
+View::View( void(*cbMainThread)(const std::function<void()>&, bool), const char* addr, uint16_t port, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb, AchievementsMgr* amgr )
+    : m_worker( addr, port, s_config.memoryLimit == 0 ? -1 : ( s_config.memoryLimitPercent * tracy::GetPhysicalMemorySize() / 100 ) )
     , m_staticView( false )
     , m_viewMode( ViewMode::LastFrames )
     , m_viewModeHeuristicTry( true )
     , m_totalMemory( GetPhysicalMemorySize() )
     , m_forceConnectionPopup( true, true )
-    , m_tc( *this, m_worker, config.threadedRendering )
+    , m_tc( *this, m_worker, s_config.threadedRendering )
     , m_frames( nullptr )
     , m_messagesScrollBottom( true )
     , m_reactToCrash( true )
     , m_reactToLostConnection( true )
-    , m_smallFont( smallFont )
-    , m_bigFont( bigFont )
-    , m_fixedFont( fixedWidth )
     , m_stcb( stcb )
     , m_sscb( sscb )
     , m_acb( acb )
     , m_cbMainThread( cbMainThread )
     , m_achievementsMgr( amgr )
-    , m_achievements( config.achievements )
-    , m_horizontalScrollMultiplier( config.horizontalScrollMultiplier )
-    , m_verticalScrollMultiplier( config.verticalScrollMultiplier )
+    , m_achievements( s_config.achievements )
+    , m_horizontalScrollMultiplier( s_config.horizontalScrollMultiplier )
+    , m_verticalScrollMultiplier( s_config.verticalScrollMultiplier )
+    , m_manualData( std::make_shared<TracyManualData>() )
+    , m_markdown( nullptr, nullptr )
 #ifdef __EMSCRIPTEN__
     , m_td( 2, "ViewMt" )
 #else
     , m_td( std::thread::hardware_concurrency(), "ViewMt" )
+    , m_llm( m_worker, *this, *m_manualData )
 #endif
 {
     InitTextEditor();
-    SetupConfig( config );
+    SetupConfig();
 }
 
-View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f, ImFont* fixedWidth, ImFont* smallFont, ImFont* bigFont, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb, const Config& config, AchievementsMgr* amgr )
+View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb, AchievementsMgr* amgr )
     : m_worker( f )
     , m_filename( f.GetFilename() )
     , m_staticView( true )
     , m_viewMode( ViewMode::Paused )
     , m_totalMemory( GetPhysicalMemorySize() )
-    , m_tc( *this, m_worker, config.threadedRendering )
+    , m_tc( *this, m_worker, s_config.threadedRendering )
     , m_frames( m_worker.GetFramesBase() )
     , m_messagesScrollBottom( false )
-    , m_smallFont( smallFont )
-    , m_bigFont( bigFont )
-    , m_fixedFont( fixedWidth )
     , m_stcb( stcb )
     , m_sscb( sscb )
     , m_acb( acb )
     , m_userData( m_worker.GetCaptureProgram().c_str(), m_worker.GetCaptureTime() )
     , m_cbMainThread( cbMainThread )
     , m_achievementsMgr( amgr )
-    , m_achievements( config.achievements )
-    , m_horizontalScrollMultiplier( config.horizontalScrollMultiplier )
-    , m_verticalScrollMultiplier( config.verticalScrollMultiplier )
+    , m_achievements( s_config.achievements )
+    , m_horizontalScrollMultiplier( s_config.horizontalScrollMultiplier )
+    , m_verticalScrollMultiplier( s_config.verticalScrollMultiplier )
+    , m_manualData( std::make_shared<TracyManualData>() )
+    , m_markdown( nullptr, nullptr )
 #ifdef __EMSCRIPTEN__
     , m_td( 2, "ViewMt" )
 #else
     , m_td( std::thread::hardware_concurrency(), "ViewMt" )
+    , m_llm( m_worker, *this, *m_manualData )
 #endif
 {
     m_notificationTime = 4;
     m_notificationText = std::string( "Trace loaded in " ) + TimeToString( m_worker.GetLoadTime() );
 
     InitTextEditor();
-    SetupConfig( config );
+    SetupConfig();
 
     m_vd.zvStart = m_worker.GetFirstTime();
     m_vd.zvEnd = m_worker.GetLastTime();
@@ -125,7 +128,9 @@ View::~View()
     if( m_compare.loadThread.joinable() ) m_compare.loadThread.join();
     if( m_saveThread.joinable() ) m_saveThread.join();
 
-    if( m_frameTexture ) FreeTexture( m_frameTexture, m_cbMainThread );
+    if( m_FrameTextureCache.textureId ) FreeTexture( m_FrameTextureCache.textureId, m_cbMainThread );
+    if( m_FrameTextureCacheConnection.textureId ) FreeTexture( m_FrameTextureCacheConnection.textureId, m_cbMainThread );
+
     if( m_playback.texture ) FreeTexture( m_playback.texture, m_cbMainThread );
 }
 
@@ -135,12 +140,18 @@ void View::InitTextEditor()
     m_sourceViewFile = nullptr;
 }
 
-void View::SetupConfig( const Config& config )
+void View::SetupConfig()
 {
-    m_vd.frameTarget = config.targetFps;
-    m_vd.dynamicColors = config.dynamicColors;
-    m_vd.forceColors = config.forceColors;
-    m_vd.shortenName = (ShortenName)config.shortenName;
+    // Keep in sync with TracyView_Options.cpp View::DrawOptions(), bottom of the file.
+    m_vd.frameTarget = s_config.targetFps;
+    m_vd.drawFrameTargets = s_config.drawFrameTargets;
+    m_vd.dynamicColors = s_config.dynamicColors;
+    m_vd.forceColors = s_config.forceColors;
+    m_vd.ghostZones = s_config.ghostZones;
+    m_vd.shortenName = (ShortenName)s_config.shortenName;
+    m_vd.drawSamples = s_config.drawSamples;
+    m_vd.drawContextSwitches = s_config.drawContextSwitches;
+    m_vd.plotHeight = s_config.plotHeight;
 }
 
 void View::Achieve( const char* id )
@@ -321,7 +332,7 @@ bool View::Draw()
 
     if( ImGui::BeginPopupModal( "Protocol mismatch", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_TRIANGLE_EXCLAMATION );
         ImGui::PopFont();
         ImGui::TextUnformatted( "The client you are trying to connect to uses incompatible protocol version.\nMake sure you are using the same Tracy version on both client and server." );
@@ -347,7 +358,7 @@ bool View::Draw()
 
     if( ImGui::BeginPopupModal( "Client not ready", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_LIGHTBULB );
         ImGui::PopFont();
         ImGui::TextUnformatted( "The client you are trying to connect to is no longer able to sent profiling data,\nbecause another server was already connected to it.\nYou can do the following:\n\n  1. Restart the client application.\n  2. Rebuild the client application with on-demand mode enabled." );
@@ -373,7 +384,7 @@ bool View::Draw()
 
     if( ImGui::BeginPopupModal( "Client disconnected", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_HANDSHAKE );
         ImGui::PopFont();
         ImGui::TextUnformatted( "The client you are trying to connect to has disconnected during the initial\nconnection handshake. Please check your network configuration." );
@@ -400,7 +411,7 @@ bool View::Draw()
     if( ImGui::BeginPopupModal( "Instrumentation failure", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
         const auto& data = m_worker.GetFailureData();
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_SKULL );
         ImGui::PopFont();
         ImGui::TextUnformatted( "Profiling session terminated due to improper instrumentation.\nPlease correct your program and try again." );
@@ -583,7 +594,7 @@ bool View::Draw()
     {
         assert( !m_filenameStaging.empty() );
         auto fn = m_filenameStaging.c_str();
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextFocused( "Path:", fn );
         ImGui::PopFont();
         ImGui::Separator();
@@ -648,7 +659,7 @@ bool View::Draw()
     if( saveFailed ) ImGui::OpenPopup( "Save failed" );
     if( ImGui::BeginPopupModal( "Save failed", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_TRIANGLE_EXCLAMATION );
         ImGui::PopFont();
         ImGui::TextUnformatted( "Could not save trace at the specified location. Try again somewhere else." );
@@ -677,7 +688,7 @@ static const char* MainWindowButtons[] = {
     ICON_FA_SQUARE " Stopped"
 };
 
-enum { MainWindowButtonsCount = sizeof( MainWindowButtons ) / sizeof( *MainWindowButtons ) };
+constexpr size_t MainWindowButtonsCount = sizeof( MainWindowButtons ) / sizeof( *MainWindowButtons );
 
 bool View::DrawImpl()
 {
@@ -687,11 +698,13 @@ bool View::DrawImpl()
         char tmp[2048];
         sprintf( tmp, "%s###Connection", m_worker.GetAddr().c_str() );
         ImGui::Begin( tmp, &keepOpen, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse );
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontNormal * 2.f );
+        ImGui::Spacing();
         TextCentered( ICON_FA_WIFI );
+        ImGui::Spacing();
         ImGui::PopFont();
-        ImGui::TextUnformatted( "Waiting for connection..." );
-        DrawWaitingDots( s_time );
+        ImGui::TextUnformatted( "Waiting for connection…" );
+        DrawWaitingDotsCentered( s_time );
         ImGui::End();
         return keepOpen;
     }
@@ -745,7 +758,7 @@ bool View::DrawImpl()
     }
 
     const auto& io = ImGui::GetIO();
-    m_wasActive = false;
+    m_wasActive.store( false, std::memory_order_release );
 
     assert( m_shortcut == ShortcutAction::None );
     if( io.KeyCtrl )
@@ -808,6 +821,7 @@ bool View::DrawImpl()
     sprintf( tmp, "%s###Profiler", m_worker.GetCaptureName().c_str() );
     ImGui::SetNextWindowSize( ImVec2( 1550, 800 ), ImGuiCond_FirstUseEver );
     ImGui::Begin( tmp, keepOpenPtr, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus );
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
 #endif
 
     if( !m_staticView )
@@ -832,7 +846,7 @@ bool View::DrawImpl()
             ImGui::EndPopup();
         }
     }
-    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
+    Worker::MainThreadDataLockGuard lock = m_worker.ObtainLockForMainThread();
     m_worker.DoPostponedWork();
     if( !m_worker.IsDataStatic() )
     {
@@ -898,7 +912,7 @@ bool View::DrawImpl()
     ImGui::SameLine();
     ToggleButton( ICON_FA_GEAR, m_showOptions );
     ImGui::SameLine();
-    ToggleButton( ICON_FA_TAGS " Messages", m_showMessages );
+    ToggleButton( ICON_FA_COMMENT " Messages", m_showMessages );
     ImGui::SameLine();
     ToggleButton( ICON_FA_MAGNIFYING_GLASS " Find", m_findZone.show );
     ImGui::SameLine();
@@ -934,6 +948,8 @@ bool View::DrawImpl()
         }
         ImGui::EndPopup();
     }
+    ImGui::SameLine();
+    ToggleButton( ICON_FA_BOOK, m_showManual );
     if( m_sscb )
     {
         ImGui::SameLine();
@@ -956,6 +972,13 @@ bool View::DrawImpl()
             ImGui::EndPopup();
         }
     }
+#ifndef __EMSCRIPTEN__
+    if( s_config.llm )
+    {
+        ImGui::SameLine();
+        ToggleButton( ICON_FA_ROBOT, m_llm.m_show );
+    }
+#endif
     if( m_worker.AreFramesUsed() )
     {
         ImGui::SameLine();
@@ -1150,6 +1173,10 @@ bool View::DrawImpl()
     if( m_sampleParents.symAddr != 0 ) DrawSampleParents();
     if( m_showRanges ) DrawRanges();
     if( m_showWaitStacks ) DrawWaitStacks();
+    if( m_showManual ) DrawManual();
+#ifndef __EMSCRIPTEN__
+    if( m_llm.m_show ) m_llm.Draw();
+#endif
 
     if( m_setRangePopup.active )
     {
@@ -1171,6 +1198,12 @@ bool View::DrawImpl()
             m_statRange.active = true;
             m_statRange.min = s;
             m_statRange.max = e;
+        }
+        if( ImGui::Selectable( ICON_FA_FIRE_FLAME_CURVED " Limit flame time range" ) )
+        {
+            m_flameRange.active = true;
+            m_flameRange.min = s;
+            m_flameRange.max = e;
         }
         if( ImGui::Selectable( ICON_FA_HOURGLASS_HALF " Limit wait stacks range" ) )
         {
@@ -1221,14 +1254,18 @@ bool View::DrawImpl()
         }
     }
 
-    m_wasActive |= m_callstackBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_sampleParentBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_callstackTreeBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_zoneinfoBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_findZoneBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_optionsLockBuzzAnim.Update( io.DeltaTime );
-    m_wasActive |= m_lockInfoAnim.Update( io.DeltaTime );
-    m_wasActive |= m_statBuzzAnim.Update( io.DeltaTime );
+    bool active = m_wasActive.load( std::memory_order_acquire );
+
+    active |= m_callstackBuzzAnim.Update( io.DeltaTime );
+    active |= m_sampleParentBuzzAnim.Update( io.DeltaTime );
+    active |= m_callstackTreeBuzzAnim.Update( io.DeltaTime );
+    active |= m_zoneinfoBuzzAnim.Update( io.DeltaTime );
+    active |= m_findZoneBuzzAnim.Update( io.DeltaTime );
+    active |= m_optionsLockBuzzAnim.Update( io.DeltaTime );
+    active |= m_lockInfoAnim.Update( io.DeltaTime );
+    active |= m_statBuzzAnim.Update( io.DeltaTime );
+
+    m_wasActive.store( active, std::memory_order_release );
 
     if( m_firstFrame )
     {
@@ -1314,7 +1351,7 @@ bool View::DrawImpl()
     }
     if( ImGui::BeginPopupModal( "Connection lost!", nullptr, ImGuiWindowFlags_AlwaysAutoResize ) )
     {
-        ImGui::PushFont( m_bigFont );
+        ImGui::PushFont( g_fonts.normal, FontBig );
         TextCentered( ICON_FA_PLUG );
         ImGui::PopFont();
         ImGui::TextUnformatted(
@@ -1330,17 +1367,31 @@ bool View::DrawImpl()
     return keepOpen;
 }
 
+void View::DrawFrameImage( FrameImageCache& cache, const FrameImage& fi, float scale )
+{
+    if ( fi.ptr != cache.dataPtr )
+    {
+        if( !cache.textureId ) cache.textureId = MakeTexture();
+        UpdateTexture( cache.textureId, m_worker.UnpackFrameImage( fi ), fi.w, fi.h );
+        cache.dataPtr = fi.ptr;
+    }
+    if( fi.flip )
+    {
+        ImGui::Image( cache.textureId, ImVec2( fi.w * scale, fi.h * scale ), ImVec2( 0, 1 ), ImVec2( 1, 0 ) );
+    }
+    else
+    {
+        ImGui::Image( cache.textureId, ImVec2( fi.w * scale, fi.h * scale ) );
+    }
+}
+
 void View::DrawTextEditor()
 {
     const auto scale = GetScale();
     ImGui::SetNextWindowSize( ImVec2( 1800 * scale, 800 * scale ), ImGuiCond_FirstUseEver );
     bool show = true;
     ImGui::Begin( "Source view", &show, ImGuiWindowFlags_NoScrollbar );
-    if( !ImGui::GetCurrentWindowRead()->SkipItems )
-    {
-        m_sourceView->UpdateFont( m_fixedFont, m_smallFont, m_bigFont );
-        m_sourceView->Render( m_worker, *this );
-    }
+    if( !ImGui::GetCurrentWindowRead()->SkipItems ) m_sourceView->Render( m_worker, *this );
     ImGui::End();
     if( !show ) m_sourceViewFile = nullptr;
 }
@@ -1362,7 +1413,7 @@ void View::DrawSourceTooltip( const char* filename, uint32_t srcline, int before
     if( m_srcHintCache.empty() ) return;
     ImGui::PushStyleVar( ImGuiStyleVar_ItemSpacing, ImVec2( 0, 0 ) );
     if( separateTooltip ) ImGui::BeginTooltip();
-    ImGui::PushFont( m_fixedFont );
+    ImGui::PushFont( g_fonts.mono, FontNormal );
     auto& lines = m_srcHintCache.get();
     const int start = std::max( 0, (int)srcline - ( before+1 ) );
     const int end = std::min<int>( m_srcHintCache.get().size(), srcline + after );
@@ -1422,7 +1473,7 @@ bool View::Save( const char* fn, FileCompression comp, int zlevel, bool buildDic
     m_userData.StateShouldBePreserved();
     m_saveThreadState.store( SaveThreadState::Saving, std::memory_order_relaxed );
     m_saveThread = std::thread( [this, f{std::move( f )}, buildDict] {
-        std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
+        Worker::MainThreadDataLockGuard lock = m_worker.ObtainLockForMainThread();
         m_worker.Write( *f, buildDict );
         f->Finish();
         const auto stats = f->GetCompressionStatistics();
@@ -1440,14 +1491,37 @@ void View::HighlightThread( uint64_t thread )
     m_drawThreadHighlight = thread;
 }
 
+void View::SelectThread( uint64_t thread )
+{
+    m_selectedThread = thread;
+}
+
 bool View::WasActive() const
 {
-    return m_wasActive ||
+    return m_wasActive.load( std::memory_order_acquire ) ||
         m_zoomAnim.active ||
         m_notificationTime > 0 ||
         !m_playback.pause ||
         m_worker.IsConnected() ||
         !m_worker.IsBackgroundDone();
+}
+
+void View::AddLlmAttachment( const nlohmann::json& json )
+{
+#ifndef __EMSCRIPTEN__
+    m_llm.AddAttachmentLocking( json.dump(), "user" );
+    m_llm.m_show = true;
+#endif
+}
+
+void View::AddLlmQuery( const char* query )
+{
+#ifndef __EMSCRIPTEN__
+    std::string str( query );
+    m_llm.AddMessageLocking( std::move( str ), "user" );
+    m_llm.m_show = true;
+    m_llm.QueueSendMessageLocking();
+#endif
 }
 
 }
